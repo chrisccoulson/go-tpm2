@@ -438,6 +438,8 @@ func LaunchTPMSimulator(opts *TPMSimulatorOptions) (stop func(), err error) {
 
 	cmd = exec.Command(mssimPath, args...)
 	cmd.Dir = mssimTmpDir // Run from the temporary directory we created
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("cannot start simulator: %w", err)
