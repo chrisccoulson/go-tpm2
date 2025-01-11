@@ -43,6 +43,8 @@ func (t *lockableTransportImpl) Read(data []byte) (int, error) {
 	}
 	defer t.endOp()
 
+	fmt.Printf("Waiting for %d bytes from LockableTransport %p\n", len(data), t)
+
 	// Send the size of the supplied buffer. We don't want to read any
 	// more bytes than this.
 	select {
@@ -63,6 +65,8 @@ func (t *lockableTransportImpl) Read(data []byte) (int, error) {
 		return 0, io.EOF
 	}
 
+	fmt.Printf(" response result for LockableTransport %p: n=%d, err=%v", t, n, err)
+
 	if n > len(data) {
 		// n should be equal to or less than the length of the supplied buffer
 		return 0, errors.New("internal error: unexpected number of bytes returned from transport routine")
@@ -72,6 +76,7 @@ func (t *lockableTransportImpl) Read(data []byte) (int, error) {
 	tmpData := make([]byte, n)                  // Make a temporary buffer to hold the bytes we're about to read from the transport routine
 	nPipe, errPipe := t.manager.r.Read(tmpData) // Read from the transport routine
 	n = copy(data, tmpData[:nPipe])             // Copy the read number of bytes from the temporary buffer into the supplied buffer
+	fmt.Printf(" response data for LockableTransport %p: %#x\n", t, data)
 	switch {
 	case err != nil: // This is an error from the underlying transport.
 		return n, err
@@ -95,6 +100,7 @@ func (t *lockableTransportImpl) Write(data []byte) (int, error) {
 	}
 	defer t.endOp()
 
+	fmt.Printf("Writing data from LockableTransport %p: %#x\n", t, data)
 	// Send the length of data we've got to the transport routine
 	select {
 	case t.manager.readyBytes <- len(data):
@@ -117,9 +123,11 @@ func (t *lockableTransportImpl) Write(data []byte) (int, error) {
 		return 0, fmt.Errorf("cannot write command bytes to transport routine: %w", err)
 	}
 
+	fmt.Printf(" written data from LockableTransport %p\n", t)
 	// Wait for the result from the transport
 	select {
 	case cmdResult := <-t.manager.cmdResult:
+		fmt.Printf(" write result for LockableTransport %p: n=%d, err=%v\n", t, cmdResult.n, cmdResult.err)
 		return cmdResult.n, cmdResult.err
 	case <-t.manager.tmb.Dying():
 	}
@@ -194,6 +202,7 @@ func (t *lockableTransportImpl) Lock() {
 
 	// We are the new lock holder on the downstream transport.
 	locking.holder = t
+	fmt.Printf("LockableTransport %p acquired lock\n", t)
 }
 
 // Unlock implements [sync.Locker.Unlock].
@@ -216,6 +225,7 @@ func (t *lockableTransportImpl) Unlock() {
 
 	// Clear the current lock holder and signal any waiters.
 	locking.holder = nil
+	fmt.Printf("LockableTransport %p released lock\n", t)
 	locking.cond.Signal()
 }
 
@@ -303,6 +313,7 @@ func (l *transportLoop) run() (err error) {
 		case ready := <-l.readyBytes:
 			// Someone has called Write via a public io.Writer with ready number of bytes.
 			// Copy these bytes into a local buffer.
+			fmt.Printf("Multiplexed transport command bytes ready: %d\n", ready)
 			buf := new(bytes.Buffer)
 			_, err := io.CopyN(buf, l.r, int64(ready))
 			switch {
@@ -316,6 +327,8 @@ func (l *transportLoop) run() (err error) {
 				return fmt.Errorf("cannot read command bytes from public io.Writer: %w", err)
 			}
 
+			fmt.Printf(" writing command bytes to real transport %#x\n", buf.Bytes())
+
 			// Write the received bytes to the underlying transport. This can be
 			// interrupted by any public io.Closer.
 			n, err := l.transport.Write(buf.Bytes())
@@ -327,6 +340,8 @@ func (l *transportLoop) run() (err error) {
 			default:
 			}
 
+			fmt.Printf(" write result, n=%d, err=%v\n", n, err)
+
 			// Send the Write result to the public io.Writer
 			select {
 			case l.cmdResult <- transportResult{n: n, err: err}:
@@ -336,6 +351,7 @@ func (l *transportLoop) run() (err error) {
 		case expected := <-l.expectedBytes:
 			// Someone has called Read via a public io.Reader with a buffer that
 			// as the expected number of bytes.
+			fmt.Printf("Multiplexed transport expecting response bytes: %d\n", expected)
 			data := make([]byte, expected)
 
 			// Read the expected number of bytes from the underlying transport. This
@@ -347,6 +363,9 @@ func (l *transportLoop) run() (err error) {
 			case err != nil:
 				err = fmt.Errorf("cannot read response bytes from transport: %w", err)
 			}
+
+			fmt.Printf(" read response bytes: %#x\n", data)
+			fmt.Printf(" read result, n=%d, err=%v\n", n, err)
 
 			// Send the Read result to the public io.Reader.
 			select {
