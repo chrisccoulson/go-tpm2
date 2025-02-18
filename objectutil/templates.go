@@ -5,6 +5,8 @@
 package objectutil
 
 import (
+	"fmt"
+
 	"github.com/canonical/go-tpm2"
 )
 
@@ -219,6 +221,95 @@ func WithDuplicationMode(mode DuplicationMode) PublicTemplateOption {
 		default:
 			panic("invalid mode")
 		}
+	}
+}
+
+// HierarchyModifier describes the modifier to apply to a hierarchy that
+// an object is stored in
+type HierarchyModifier int
+
+const (
+	// HierarchyLimitNone means that the object will be stored in an unlimited
+	// hierarchy. These correspond to the TPM_RH_OWNER, TPM_RH_ENDORSEMENT,
+	// TPM_RH_PLATFORM and TPM_RH_NULL hierarchies.
+	HierarchyLimitNone HierarchyModifier = iota
+
+	// HierarchyFirmwareLimited means that the object will be stored in a hierarchy
+	// that can only be accessed by the current TPM firmware. These correspond to
+	// TPM_RH_FW_OWNER, TPM_RH_FW_ENDORSEMENT, TPM_RH_FW_PLATFORM and TPM_RH_FW_NULL
+	// hierarchies.
+	HierarchyFirmwareLimited
+
+	// HierarchySVNLimited means that the object will be stored in a SVN limited
+	// hierarchy. TPM firmware is not able to access hierarchies with a SVN newer than
+	// its current one, which makes it possible to create objects that cannot be
+	// accessed by rolling back the TPM firmware to an older version with a lower SVN
+	// which might have been subject to a vulnerability. These correspond to the base
+	// hierarchies TPM_RH_SVN_OWNER_BASE, TPM_RH_SVN_ENDORSEMENT_BASE,
+	// TPM_RH_SVN_PLATFORM_BASE, and TPM_RH_SVN_NULL_BASE.
+	HierarchySVNLimited
+)
+
+// WithHierarchyModifier returns an option for the specified hierarchy modifier.
+//
+// If mode if [HierarchyLimitNone], then the [tpm2.AttrFirmwareLimited] and [tpm2.AttrSVNLimited]
+// attributes are cleared.
+//
+// If mode is [HierarchyFirmwareLimited], then the [tpm2.AttrFirmwareLimited] attribute is set
+// and the [tpm2.AttrSVNLimited] attribute is cleared.
+//
+// If mode is [HierarchySVNLimited, then the [tpm2.AttrSVNLimited] attribute is set and the
+// [tpm2.AttrFirmwareLimited] attribute is cleared.
+//
+// Note that these attributes must match the attributes of the parent object.
+func WithHierarchyModifier(modifier HierarchyModifier) PublicTemplateOption {
+	return func(pub *tpm2.Public) {
+		switch modifier {
+		case HierarchyLimitNone:
+			pub.Attrs &^= (tpm2.AttrFirmwareLimited | tpm2.AttrSVNLimited)
+		case HierarchyFirmwareLimited:
+			pub.Attrs |= tpm2.AttrFirmwareLimited
+			pub.Attrs &^= tpm2.AttrSVNLimited
+		case HierarchySVNLimited:
+			pub.Attrs |= tpm2.AttrSVNLimited
+			pub.Attrs &^= tpm2.AttrFirmwareLimited
+		default:
+			panic("invalid modifier")
+		}
+	}
+}
+
+// WithHierarchyModifierFromParent applies the appropriate [HierarchyModifier]
+// depending on the attributes of the supplied parent public area. This will
+// panic if the supplied parent has both [tpm2.AttrFirmwareLimited] and
+// [tpm2.AttrSVNLimited] attributes set.
+func WithHierarchyModifierFromParent(parent *tpm2.Public) PublicTemplateOption {
+	switch parent.Attrs & (tpm2.AttrFirmwareLimited | tpm2.AttrSVNLimited) {
+	case 0:
+		return WithHierarchyModifier(HierarchyLimitNone)
+	case tpm2.AttrFirmwareLimited:
+		return WithHierarchyModifier(HierarchyFirmwareLimited)
+	case tpm2.AttrSVNLimited:
+		return WithHierarchyModifier(HierarchySVNLimited)
+	default:
+		panic("invalid combination of firmwareLimited and svnLimited attributes")
+	}
+}
+
+// WithHierarchyModifierFromHierarchy applies the appropriate [HierarchyModifier]
+// depending on the supplied handle. This is useful when creating a primary object
+// in a hierarchy. This will panic if the supplied handle does not correspond to a
+// hierarchy that supports firmware or SVN binding.
+func WithHierarchyModifierFromHierarchy(handle tpm2.Handle) PublicTemplateOption {
+	switch {
+	case handle.IsFWBoundHierarchy():
+		return WithHierarchyModifier(HierarchyFirmwareLimited)
+	case handle.IsSVNBoundHierarchy():
+		return WithHierarchyModifier(HierarchySVNLimited)
+	case handle.SupportsHierarchyFWOrSVNBinding():
+		return WithHierarchyModifier(HierarchyLimitNone)
+	default:
+		panic(fmt.Sprintf("handle %v does not correspond to a hierarchy that supports firmware or SVN binding", handle))
 	}
 }
 

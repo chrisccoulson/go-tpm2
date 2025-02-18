@@ -32,6 +32,8 @@ const (
 	AttrSensitiveDataOrigin  ObjectAttributes = 1 << 5  // sensitiveDataOrigin
 	AttrUserWithAuth         ObjectAttributes = 1 << 6  // userWithAuth
 	AttrAdminWithPolicy      ObjectAttributes = 1 << 7  // adminWithPolicy
+	AttrFirmwareLimited      ObjectAttributes = 1 << 8  // firmwareLimited
+	AttrSVNLimited           ObjectAttributes = 1 << 9  // svnLimited
 	AttrNoDA                 ObjectAttributes = 1 << 10 // noDA
 	AttrEncryptedDuplication ObjectAttributes = 1 << 11 // encryptedDuplication
 	AttrRestricted           ObjectAttributes = 1 << 16 // restricted

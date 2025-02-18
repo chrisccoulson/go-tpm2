@@ -27,10 +27,13 @@ type HandleContext interface {
 	Name() Name                        // The name of the entity. This will be empty if there isn't one or Dispose has been called.
 	SerializeToBytes() []byte          // Return a byte slice containing the serialized form of this HandleContext
 	SerializeToWriter(io.Writer) error // Write the serialized form of this HandleContext to the supplied io.Writer
-	Dispose()                          // Called when the corresponding resource has been flushed or evicted from the TPM
+
+	// Dispose is called by this package when the corresponding resource has been flushed or evicted from the TPM.
+	Dispose()
 }
 
-// SessionContextParams corresponds to the parameters of a session.
+// SessionContextParams corresponds to the parameters of a session. These don't
+// change throughout the lifecycle of a session.
 type SessionContextParams struct {
 	HashAlg     HashAlgorithmId // The session's digest algorithm
 	IsBound     bool            // Whether the session is bound.
@@ -39,7 +42,8 @@ type SessionContextParams struct {
 	SessionKey  []byte          // The session key
 }
 
-// SessionContextState corresponds to the state of a session.
+// SessionContextState corresponds to the state of a session. This contains fields
+// that do change with usage of the session.
 type SessionContextState struct {
 	NonceTPM       Nonce // The most recent TPM nonce value
 	IsAudit        bool  // Whether the session is currently an audit session
@@ -94,6 +98,8 @@ type ResourceContext interface {
 	// SetAuthValue sets the authorization value that will be used in authorization roles where
 	// knowledge of the authorization value is required. Functions that create resources on the TPM
 	// and return a ResourceContext will set this automatically, else it will need to be set manually.
+	//
+	// The authorization value is omitted when seriailizing this HandleContext.
 	SetAuthValue([]byte)
 }
 
@@ -114,7 +120,8 @@ type NVIndexContext interface {
 	Type() NVType
 
 	// SetAttr is called when an attribute is set so that the context
-	// can update its name.
+	// can update its name. This is called from inside this package when
+	// executing TPM commands that update the attributes for an index.
 	SetAttr(a NVAttributes)
 }
 
@@ -131,7 +138,7 @@ type handleContextU struct {
 
 func (d *handleContextU) Select(selector reflect.Value) interface{} {
 	switch selector.Interface().(handleContextType) {
-	case handleContextTypePermanent, handleContextTypeLimitedResource, handleContextTypeLimited:
+	case handleContextTypePermanent, handleContextTypeLimitedResource, handleContextTypeLimited, handleContextTypeDisposed, handleContextTypePermanentFWOrSVNLimited:
 		return mu.NilUnionValue
 	case handleContextTypeNVIndex:
 		return &d.NV
@@ -165,22 +172,9 @@ const (
 	// handleContextTypeDisposed exists to prevent serializing handles where HandleContext.Dispose
 	// has been called.
 	handleContextTypeDisposed handleContextType = 7
-)
 
-func handleContextTypeFromHandle(handle Handle) handleContextType {
-	switch handle.Type() {
-	case HandleTypePCR, HandleTypePermanent:
-		return handleContextTypePermanent
-	case HandleTypeNVIndex:
-		return handleContextTypeNVIndex
-	case HandleTypeHMACSession, HandleTypePolicySession:
-		return handleContextTypeSession
-	case HandleTypeTransient, HandleTypePersistent:
-		return handleContextTypeObject
-	default:
-		panic("invalid handle type")
-	}
-}
+	handleContextTypePermanentFWOrSVNLimited = 8 // corresponds to permanentContextFWOrSVNLimited
+)
 
 type handleContext struct {
 	HandleType   handleContextType
@@ -192,7 +186,7 @@ type handleContext struct {
 
 func newHandleContext(handle Handle) HandleContext {
 	switch handle.Type() {
-	case HandleTypePCR, HandleTypeNVIndex, HandleTypeHMACSession, HandleTypePolicySession, HandleTypePermanent, HandleTypeTransient, HandleTypePersistent:
+	case HandleTypeNVIndex, HandleTypeHMACSession, HandleTypePolicySession, HandleTypeTransient, HandleTypePersistent:
 		out := &handleContext{
 			HandleType:   handleContextTypeLimited,
 			HandleHandle: handle,
@@ -245,19 +239,8 @@ func (h *handleContext) Dispose() {
 	}
 }
 
-func (h *handleContext) checkValid() error {
+func (h *handleContext) checkLoadedValid() error {
 	switch h.HandleType {
-	case handleContextTypePermanent:
-		switch h.HandleHandle.Type() {
-		case HandleTypePCR, HandleTypePermanent:
-			// ok
-		default:
-			return errors.New("unexpected handle type for permanent context")
-		}
-		expectedName := MakeHandleName(h.HandleHandle)
-		if !bytes.Equal(h.HandleName, expectedName) {
-			return errors.New("unexpected name for permanent context")
-		}
 	case handleContextTypeNVIndex:
 		switch h.HandleHandle.Type() {
 		case HandleTypeNVIndex:
@@ -349,7 +332,7 @@ func (h *handleContext) checkValid() error {
 			return errors.New("unexpected name for limited context")
 		}
 	default:
-		panic("not reached")
+		return fmt.Errorf("invalid handle type %v", h.HandleType)
 	}
 
 	return nil
@@ -362,7 +345,7 @@ type resourceContext struct {
 
 func newResourceContext(handle Handle, name Name) ResourceContext {
 	switch handle.Type() {
-	case HandleTypePCR, HandleTypeNVIndex, HandleTypePermanent, HandleTypeTransient, HandleTypePersistent:
+	case HandleTypeNVIndex, HandleTypeTransient, HandleTypePersistent:
 		out := &resourceContext{
 			handleContext: handleContext{
 				HandleType:   handleContextTypeLimitedResource,
@@ -413,6 +396,46 @@ func newPermanentContext(handle Handle) *permanentContext {
 }
 
 var _ ResourceContext = (*permanentContext)(nil)
+
+type permanentContextFWOrSVNLimited struct {
+	permanentContext
+	base *permanentContext
+}
+
+func newPermanentContextFWOrSVNLimited(handle Handle, base *permanentContext) *permanentContextFWOrSVNLimited {
+	switch handle.Type() {
+	case HandleTypePermanent:
+		if !handle.IsFWBoundHierarchy() && !handle.IsSVNBoundHierarchy() {
+			panic("handle is not FW or SVN bound")
+		}
+		return &permanentContextFWOrSVNLimited{
+			permanentContext: permanentContext{
+				resourceContext: resourceContext{
+					handleContext: handleContext{
+						HandleType:   handleContextTypePermanentFWOrSVNLimited,
+						HandleHandle: handle,
+						HandleName:   MakeHandleName(handle),
+					},
+				},
+			},
+			base: base,
+		}
+	default:
+		panic("invalid handle type")
+	}
+}
+
+func (p *permanentContextFWOrSVNLimited) AuthValue() []byte {
+	// FW or SVN bound hierarchies share an authorization value with their base.
+	return p.base.AuthValue()
+}
+
+func (p *permanentContextFWOrSVNLimited) SetAuthValue(value []byte) {
+	// FW or SVN bound hierarchies share an authorization value with their base.
+	p.base.SetAuthValue(value)
+}
+
+var _ ResourceContext = (*permanentContextFWOrSVNLimited)(nil)
 
 func nullResource() ResourceContext {
 	return newPermanentContext(HandleNull)
@@ -690,6 +713,13 @@ func (t *TPMContext) newResourceContextFromTPM(handle HandleContext, sessions ..
 // If the specified handle is an object, the returned context can be type asserted to [ObjectContext].
 // If the specified handle is a NV index, the returned context can be type asserted to [NVIndexContext].
 func (t *TPMContext) NewResourceContext(handle Handle, sessions ...SessionContext) (ResourceContext, error) {
+	switch handle.Type() {
+	case HandleTypeNVIndex, HandleTypeTransient, HandleTypePersistent:
+		// ok
+	default:
+		return nil, errors.New("invalid handle type")
+	}
+
 	rc, err := t.newResourceContextFromTPM(newHandleContext(handle))
 	if err != nil {
 		return nil, err
@@ -736,12 +766,7 @@ func (t *TPMContext) CreateResourceContextFromTPM(handle Handle, sessions ...Ses
 // This function will panic if handle doesn't correspond to a session, transient or
 // persistent object, or NV index.
 func NewHandleContext(handle Handle) HandleContext {
-	switch handle.Type() {
-	case HandleTypeNVIndex, HandleTypeHMACSession, HandleTypePolicySession, HandleTypeTransient, HandleTypePersistent:
-		return newHandleContext(handle)
-	default:
-		panic("invalid handle type")
-	}
+	return newHandleContext(handle)
 }
 
 // NewLimitedHandleContext creates a new HandleContext for the specified handle. The
@@ -784,7 +809,16 @@ func (t *TPMContext) GetPermanentContext(handle Handle) ResourceContext {
 			return rc
 		}
 
-		rc := newPermanentContext(handle)
+		var rc ResourceContext
+
+		switch {
+		case handle.IsFWBoundHierarchy() || handle.IsSVNBoundHierarchy():
+			base := t.GetPermanentContext(handle.BaseHierarchy())
+			rc = newPermanentContextFWOrSVNLimited(handle, base.(*permanentContext))
+		default:
+			rc = newPermanentContext(handle)
+		}
+
 		t.permanentResources[handle] = rc
 		return rc
 	default:
@@ -797,9 +831,87 @@ func (t *TPMContext) OwnerHandleContext() ResourceContext {
 	return t.GetPermanentContext(HandleOwner)
 }
 
+// OwnerHandleContextFWLimited returns the ResourceContext corresponding to the owner
+// hierarchy in which objects bound to the current TPM firmware can be accessed.
+//
+// This function will call [TPMContext.InitProperties] if it hasn't already been called.
+//
+// The returned ResourceContext shares an authorization value with the ResourceContext
+// retuned from [TPMContext.OwnerHandleContext].
+//
+// This will return nil if the TPM isn't new enough to support firmware bound
+// hierarchies.
+func (t *TPMContext) OwnerHandleContextFWLimited() ResourceContext {
+	if err := t.initPropertiesIfNeeded(); err != nil {
+		return nil
+	}
+	if !t.properties.supportsFWBinding {
+		return nil
+	}
+	return t.GetPermanentContext(HandleFWOwner)
+}
+
+// OwnerHandleContextSVNLimited returns the ResourceContext corresponding to the owner
+// hierarchy in which objects bound to the current TPM firmware's SVN can be accessed.
+//
+// This function will call [TPMContext.InitProperties] if it hasn't already been called.
+//
+// The returned ResourceContext shares an authorization value with the ResourceContext
+// retuned from [TPMContext.OwnerHandleContext].
+//
+// This will return nil if the TPM isn't new enough to support SVN bound hierarchies.
+func (t *TPMContext) OwnerHandleContextSVNLimited() ResourceContext {
+	if err := t.initPropertiesIfNeeded(); err != nil {
+		return nil
+	}
+	if !t.properties.supportsSVNBinding {
+		return nil
+	}
+	return t.GetPermanentContext(HandleSVNOwnerBase.WithSVNBinding(t.properties.currentSVN))
+}
+
 // NulHandleContext returns the ResourceContext corresponding to the null hiearchy.
 func (t *TPMContext) NullHandleContext() ResourceContext {
 	return t.GetPermanentContext(HandleNull)
+}
+
+// NulHandleContextFWLimited returns the ResourceContext corresponding to the null
+// hierarchy in which objects bound to the current TPM firmware can be accessed.
+//
+// This function will call [TPMContext.InitProperties] if it hasn't already been called.
+//
+// The returned ResourceContext shares an authorization value with the ResourceContext
+// retuned from [TPMContext.NullHandleContext].
+//
+// This will return nil if the TPM isn't new enough to support firmware bound
+// hierarchies.
+func (t *TPMContext) NullHandleContextFWLimited() ResourceContext {
+	if err := t.initPropertiesIfNeeded(); err != nil {
+		return nil
+	}
+	if !t.properties.supportsFWBinding {
+		return nil
+	}
+	return t.GetPermanentContext(HandleFWNull)
+}
+
+// NullHandleContextSVNLimited returns the ResourceContext corresponding to the null
+// hierarchy in which objects bound to the current TPM firmware's SVN can be accessed.
+//
+// This function will call [TPMContext.InitProperties] if it hasn't already been called.
+//
+// The returned ResourceContext shares an authorization value with the ResourceContext
+// retuned from [TPMContext.NullHandleContext].
+//
+// This will return nil if the TPM isn't new enough to support SVN bound hierarchies.
+func (t *TPMContext) NullHandleContextSVNLimited() ResourceContext {
+	if err := t.initPropertiesIfNeeded(); err != nil {
+		return nil
+	}
+	if !t.properties.supportsSVNBinding {
+		return nil
+	}
+	return t.GetPermanentContext(HandleSVNNullBase.WithSVNBinding(t.properties.currentSVN))
 }
 
 // LockoutHandleContext returns the ResourceContext corresponding to the lockout hiearchy.
@@ -812,9 +924,89 @@ func (t *TPMContext) EndorsementHandleContext() ResourceContext {
 	return t.GetPermanentContext(HandleEndorsement)
 }
 
+// EndorsementHandleContextFWLimited returns the ResourceContext corresponding to the
+// endorsement hierarchy in which objects bound to the current TPM firmware can be accessed.
+//
+// This function will call [TPMContext.InitProperties] if it hasn't already been called.
+//
+// The returned ResourceContext shares an authorization value with the ResourceContext
+// retuned from [TPMContext.EndorsementHandleContext].
+//
+// This will return nil if the TPM isn't new enough to support firmware bound
+// hierarchies.
+func (t *TPMContext) EndorsementHandleContextFWLimited() ResourceContext {
+	if err := t.initPropertiesIfNeeded(); err != nil {
+		return nil
+	}
+	if !t.properties.supportsFWBinding {
+		return nil
+	}
+	return t.GetPermanentContext(HandleFWEndorsement)
+}
+
+// EndorsementHandleContextSVNLimited returns the ResourceContext corresponding to the
+// endorsement hierarchy in which objects bound to the current TPM firmware's SVN can be
+// accessed.
+//
+// This function will call [TPMContext.InitProperties] if it hasn't already been called.
+//
+// The returned ResourceContext shares an authorization value with the ResourceContext
+// retuned from [TPMContext.EndorsementHandleContext].
+//
+// This will return nil if the TPM isn't new enough to support SVN bound hierarchies.
+func (t *TPMContext) EndosementHandleContextSVNLimited() ResourceContext {
+	if err := t.initPropertiesIfNeeded(); err != nil {
+		return nil
+	}
+	if !t.properties.supportsSVNBinding {
+		return nil
+	}
+	return t.GetPermanentContext(HandleSVNEndorsementBase.WithSVNBinding(t.properties.currentSVN))
+}
+
 // PlatformHandleContext returns the ResourceContext corresponding to the platform hiearchy.
 func (t *TPMContext) PlatformHandleContext() ResourceContext {
 	return t.GetPermanentContext(HandlePlatform)
+}
+
+// PlatformHandleContextFWLimited returns the ResourceContext corresponding to the
+// platform hierarchy in which objects bound to the current TPM firmware can be accessed.
+//
+// This function will call [TPMContext.InitProperties] if it hasn't already been called.
+//
+// The returned ResourceContext shares an authorization value with the ResourceContext
+// retuned from [TPMContext.PlatformHandleContext].
+//
+// This will return nil if the TPM isn't new enough to support firmware bound
+// hierarchies.
+func (t *TPMContext) PlatformHandleContextFWLimited() ResourceContext {
+	if err := t.initPropertiesIfNeeded(); err != nil {
+		return nil
+	}
+	if !t.properties.supportsFWBinding {
+		return nil
+	}
+	return t.GetPermanentContext(HandleFWPlatform)
+}
+
+// PlatformHandleContextSVNLimited returns the ResourceContext corresponding to the
+// platform hierarchy in which objects bound to the current TPM firmware's SVN can be
+// accessed.
+//
+// This function will call [TPMContext.InitProperties] if it hasn't already been called.
+//
+// The returned ResourceContext shares an authorization value with the ResourceContext
+// retuned from [TPMContext.PlatformHandleContext].
+//
+// This will return nil if the TPM isn't new enough to support SVN bound hierarchies.
+func (t *TPMContext) PlatformHandleContextSVNLimited() ResourceContext {
+	if err := t.initPropertiesIfNeeded(); err != nil {
+		return nil
+	}
+	if !t.properties.supportsSVNBinding {
+		return nil
+	}
+	return t.GetPermanentContext(HandleSVNPlatformBase.WithSVNBinding(t.properties.currentSVN))
 }
 
 // PlatformNVHandleContext returns the ResourceContext corresponding to the platform hiearchy.
@@ -842,6 +1034,10 @@ func (t *TPMContext) PCRHandleContext(pcr int) ResourceContext {
 // If a ResourceContext is returned and subsequent use of it requires knowledge of the
 // authorization value of the corresponding TPM resource, this should be provided by calling
 // [ResourceContext].SetAuthValue.
+//
+// This will return an error in the event that the serialized context corresponded to a permanent
+// resource or some type of limited resource or handle. These do not have any useful host context,
+// and in the case of permanent resources, they are also bound to a [TPMContext].
 func NewHandleContextFromReader(r io.Reader) (HandleContext, error) {
 	var integrityAlg HashAlgorithmId
 	var integrity []byte
@@ -868,13 +1064,11 @@ func NewHandleContextFromReader(r io.Reader) (HandleContext, error) {
 		return nil, errors.New("context blob contains trailing bytes")
 	}
 
-	if err := data.checkValid(); err != nil {
+	if err := data.checkLoadedValid(); err != nil {
 		return nil, err
 	}
 
 	switch data.HandleType {
-	case handleContextTypePermanent:
-		return newPermanentContext(data.Handle()), nil
 	case handleContextTypeNVIndex:
 		return newNVIndexContext(data.Handle(), data.Name(), data.Data.NV), nil
 	case handleContextTypeSession:
@@ -903,6 +1097,10 @@ func NewHandleContextFromReader(r io.Reader) (HandleContext, error) {
 // authorization value of the corresponding TPM resource, this should be provided by calling
 // [ResourceContext].SetAuthValue.
 //
+// This will return an error in the event that the serialized context corresponded to a permanent
+// resource or some type of limited resource or handle. These do not have any useful host context,
+// and in the case of permanent resources, they are also bound to a [TPMContext].
+//
 // Deprecated: Use [NewHandleContextFromReader].
 func CreateHandleContextFromReader(r io.Reader) (HandleContext, error) {
 	return NewHandleContextFromReader(r)
@@ -918,6 +1116,10 @@ func CreateHandleContextFromReader(r io.Reader) (HandleContext, error) {
 // If a ResourceContext is returned and subsequent use of it requires knowledge of the
 // authorization value of the corresponding TPM resource, this should be provided by calling
 // [ResourceContext].SetAuthValue.
+//
+// This will return an error in the event that the serialized context corresponded to a permanent
+// resource or some type of limited resource or handle. These do not have any useful host context,
+// and in the case of permanent resources, they are also bound to a [TPMContext].
 func NewHandleContextFromBytes(b []byte) (HandleContext, int, error) {
 	buf := bytes.NewReader(b)
 	rc, err := NewHandleContextFromReader(buf)
@@ -938,13 +1140,17 @@ func NewHandleContextFromBytes(b []byte) (HandleContext, int, error) {
 // authorization value of the corresponding TPM resource, this should be provided by calling
 // [ResourceContext].SetAuthValue.
 //
+// This will return an error in the event that the serialized context corresponded to a permanent
+// resource or some type of limited resource or handle. These do not have any useful host context,
+// and in the case of permanent resources, they are also bound to a [TPMContext].
+//
 // Deprecated: Use [NewHandleContextFromBytes].
 func CreateHandleContextFromBytes(b []byte) (HandleContext, int, error) {
 	return NewHandleContextFromBytes(b)
 }
 
 // NewResourceContext creates a new ResourceContext with the specified handle and name. The
-// returned ResourceContext has limited functionality - eg, it cannot bs used in functions that
+// returned ResourceContext has limited functionality - eg, it cannot be used in functions that
 // require knowledge of the public area associated with the resource (such as
 // [TPMContext.StartAuthSession]), and some NV functions that modify the attributes of an index
 // will not update its name. It cannot be type asserted to [ObjectContext] or [NVIndexContext].
@@ -956,12 +1162,7 @@ func CreateHandleContextFromBytes(b []byte) (HandleContext, int, error) {
 // This function will panic if handle doesn't correspond to a transient or persistent object, or an
 // NV index.
 func NewResourceContext(handle Handle, name Name) ResourceContext {
-	switch handle.Type() {
-	case HandleTypeNVIndex, HandleTypeTransient, HandleTypePersistent:
-		return newResourceContext(handle, name)
-	default:
-		panic("invalid handle type")
-	}
+	return newResourceContext(handle, name)
 }
 
 // NewLimitedResourceContext creates a new ResourceContext with the specified handle and name. The

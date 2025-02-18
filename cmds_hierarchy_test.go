@@ -197,7 +197,7 @@ func (s *hierarchySuite) TestCreatePrimaryWithNilHierarchy(c *C) {
 	template := objectutil.NewRSAStorageKeyTemplate(
 		objectutil.WithRSAUnique(make([]byte, 256)),
 	)
-	_, _, _, _, _, err := s.TPM.CreatePrimary(nil, nil, &template, nil, nil, nil)
+	_, _, _, _, _, err := s.TPM.CreatePrimary(nil, nil, template, nil, nil, nil)
 	c.Check(IsTPMHandleError(err, ErrorValue, CommandCreatePrimary, 1), internal_testutil.IsTrue)
 }
 

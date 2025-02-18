@@ -147,6 +147,80 @@ func (s *templatesSuite) TestWithDuplicationModeInvalidProtectionGroupMode(c *C)
 	c.Check(func() { WithDuplicationMode(DuplicationRootEncrypted)(pub) }, PanicMatches, "invalid mode for protection group")
 }
 
+func (s *templatesSuite) TestWithHierarchyModifierLimitNone(c *C) {
+	pub := new(tpm2.Public)
+	WithHierarchyModifier(HierarchyLimitNone)(pub)
+	c.Check(pub.Attrs&(tpm2.AttrFirmwareLimited|tpm2.AttrSVNLimited), Equals, tpm2.ObjectAttributes(0))
+}
+
+func (s *templatesSuite) TestWithHierarchyModifierFirmwareLimited(c *C) {
+	pub := new(tpm2.Public)
+	WithHierarchyModifier(HierarchyFirmwareLimited)(pub)
+	c.Check(pub.Attrs&(tpm2.AttrFirmwareLimited|tpm2.AttrSVNLimited), Equals, tpm2.AttrFirmwareLimited)
+}
+
+func (s *templatesSuite) TestWithHierarchyModifierSVNLimited(c *C) {
+	pub := new(tpm2.Public)
+	WithHierarchyModifier(HierarchySVNLimited)(pub)
+	c.Check(pub.Attrs&(tpm2.AttrFirmwareLimited|tpm2.AttrSVNLimited), Equals, tpm2.AttrSVNLimited)
+}
+
+func (s *templatesSuite) TestWithHierarchyModifierFromParentLimitNone(c *C) {
+	parent := new(tpm2.Public)
+	pub := new(tpm2.Public)
+	WithHierarchyModifierFromParent(parent)(pub)
+	c.Check(pub.Attrs&(tpm2.AttrFirmwareLimited|tpm2.AttrSVNLimited), Equals, tpm2.ObjectAttributes(0))
+}
+
+func (s *templatesSuite) TestWithHierarchyModifierFromParentFirmwareLimited(c *C) {
+	parent := &tpm2.Public{
+		Attrs: tpm2.AttrFirmwareLimited,
+	}
+	pub := new(tpm2.Public)
+	WithHierarchyModifierFromParent(parent)(pub)
+	c.Check(pub.Attrs&(tpm2.AttrFirmwareLimited|tpm2.AttrSVNLimited), Equals, tpm2.AttrFirmwareLimited)
+}
+
+func (s *templatesSuite) TestWithHierarchyModifierFromParentSVNLimited(c *C) {
+	parent := &tpm2.Public{
+		Attrs: tpm2.AttrSVNLimited,
+	}
+	pub := new(tpm2.Public)
+	WithHierarchyModifierFromParent(parent)(pub)
+	c.Check(pub.Attrs&(tpm2.AttrFirmwareLimited|tpm2.AttrSVNLimited), Equals, tpm2.AttrSVNLimited)
+}
+
+func (s *templatesSuite) TestWithHierarchyModifierFromParentInvalid(c *C) {
+	parent := &tpm2.Public{
+		Attrs: tpm2.AttrSVNLimited | tpm2.AttrFirmwareLimited,
+	}
+	pub := new(tpm2.Public)
+	c.Check(func() { WithHierarchyModifierFromParent(parent)(pub) }, PanicMatches, `invalid combination of firmwareLimited and svnLimited attributes`)
+}
+
+func (s *templatesSuite) TestWithHierarchyModifierFromHierarchyLimitNone(c *C) {
+	pub := new(tpm2.Public)
+	WithHierarchyModifierFromHierarchy(tpm2.HandleNull)(pub)
+	c.Check(pub.Attrs&(tpm2.AttrFirmwareLimited|tpm2.AttrSVNLimited), Equals, tpm2.ObjectAttributes(0))
+}
+
+func (s *templatesSuite) TestWithHierarchyModifierFromHierarchyFirmwareLimited(c *C) {
+	pub := new(tpm2.Public)
+	WithHierarchyModifierFromHierarchy(tpm2.HandleFWEndorsement)(pub)
+	c.Check(pub.Attrs&(tpm2.AttrFirmwareLimited|tpm2.AttrSVNLimited), Equals, tpm2.AttrFirmwareLimited)
+}
+
+func (s *templatesSuite) TestWithHierarchyModifierFromHierarchySVNLimited(c *C) {
+	pub := new(tpm2.Public)
+	WithHierarchyModifierFromHierarchy(tpm2.HandleSVNPlatformBase + 100)(pub)
+	c.Check(pub.Attrs&(tpm2.AttrFirmwareLimited|tpm2.AttrSVNLimited), Equals, tpm2.AttrSVNLimited)
+}
+
+func (s *templatesSuite) TestWithHierarchyModifierFromHierarchyInvalidHandle(c *C) {
+	pub := new(tpm2.Public)
+	c.Check(func() { WithHierarchyModifierFromHierarchy(tpm2.HandleUnassigned)(pub) }, PanicMatches, `handle TPM_RH_UNASSIGNED does not correspond to a hierarchy that supports firmware or SVN binding`)
+}
+
 func (s *templatesSuite) TestWithAuthPolicy(c *C) {
 	pub := &tpm2.Public{NameAlg: tpm2.HashAlgorithmSHA256}
 	WithAuthPolicy(make([]byte, 32))(pub)

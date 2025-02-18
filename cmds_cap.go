@@ -267,20 +267,37 @@ func (t *TPMContext) GetCapabilityHandles(firstHandle Handle, propertyCount uint
 // DoesHandleExist is a convenience function for [TPMContext.GetCapability] that determines if a
 // resource with the specified handle exists on the TPM. This will indicate that the resource does
 // not exist if the TPM returns an error. If handle corresponds to a session, this will only return
-// true if the session is loaded.
+// true if the session is loaded. When testing for the existence of a loaded session, the actual
+// session handle should be supplied (there is no heed to manually use [Handle.AsLoadedSession], as
+// this function does it internally).
 func (t *TPMContext) DoesHandleExist(handle Handle, sessions ...SessionContext) bool {
-	origHandle := handle
-	if handle.Type() == HandleTypeSavedSession {
-		handle &= 0x00ffffff
-		handle |= Handle(HandleTypeLoadedSession) << 24
+	// In the case where we query for a loaded session. we pass the
+	// handle type HandleTypeLoadedSession, but the session that the
+	// TPM responds with (if the corresponding session is loaded) will
+	// be the proper session handle with the ability to distinguish
+	// between a HMAC or policy session. We save the supplied handle
+	// in order to detect this case.
+	reqHandle := handle
+
+	switch handle.Type() {
+	case HandleTypeLoadedSession, HandleTypeSavedSession:
+		reqHandle = handle.AsLoadedSession()
 	}
 
-	handles, err := t.GetCapabilityHandles(handle, 1, sessions...)
+	handles, err := t.GetCapabilityHandles(reqHandle, 1, sessions...)
 	if err != nil {
 		return false
 	}
-	if len(handles) == 0 || handles[0] != origHandle {
-		return false
+
+	switch reqHandle.Type() {
+	case HandleTypeLoadedSession, HandleTypeSavedSession:
+		if len(handles) == 0 || !handles[0].SessionHandleMatches(handle) {
+			return false
+		}
+	default:
+		if len(handles) == 0 || handles[0] != handle {
+			return false
+		}
 	}
 	return true
 }
@@ -296,17 +313,15 @@ func (t *TPMContext) DoesSavedSessionExist(handle Handle, sessions ...SessionCon
 		return false
 	}
 
-	handle &= 0x00ffffff
-	handle |= Handle(HandleTypeSavedSession) << 24
+	// Request saved sessions.
+	handle = handle.AsSavedSession()
 
 	handles, err := t.GetCapabilityHandles(handle, 1, sessions...)
 	if err != nil {
 		return false
 	}
 
-	handle &= 0x00ffffff
-	handle |= Handle(HandleTypeHMACSession) << 24
-	if len(handles) == 0 || handles[0] != handle {
+	if len(handles) == 0 || !handles[0].SessionHandleMatches(handle) {
 		return false
 	}
 	return true
@@ -488,6 +503,22 @@ func (t *TPMContext) GetMinPCRSelectSize(sessions ...SessionContext) (uint8, err
 		return 0, &InvalidResponseError{CommandGetCapability, ErrCapabilityValueOutOfRange}
 	}
 	return uint8(n), nil
+}
+
+// GetFirmwareSVN is a convenience function for [TPMContext.GetCapability] that returns the
+// value of the [PropertyFirmwareSVN] property, which indicates the security version number of
+// the TPM's current firmware. It may return a [ErrCapabilityValueOutOfRange] error if the
+// returned value doesn't fit into uint16, or a [MissingPropertyError[Property]] error if
+// the TPM isn't new enough to support SVN bound hierarchies.
+func (t *TPMContext) GetFirmwareSVN(sessions ...SessionContext) (uint16, error) {
+	n, err := t.GetCapabilityTPMProperty(PropertyFirmwareSVN, sessions...)
+	if err != nil {
+		return 0, err
+	}
+	if n > math.MaxUint16 {
+		return 0, &InvalidResponseError{CommandGetCapability, ErrCapabilityValueOutOfRange}
+	}
+	return uint16(n), nil
 }
 
 // GetCapabilityPCRProperties is a convenience function for [TPMContext.GetCapability], and returns

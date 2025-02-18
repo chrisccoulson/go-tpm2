@@ -199,9 +199,12 @@ func (e *execContext) RunCommand(c *cmdContext, responseHandle *Handle) (*rspCon
 }
 
 type tpmDeviceProperties struct {
-	maxBufferSize    uint16
-	minPcrSelectSize uint8
-	maxNVBufferSize  uint16
+	maxBufferSize      uint16
+	minPcrSelectSize   uint8
+	maxNVBufferSize    uint16
+	supportsFWBinding  bool
+	supportsSVNBinding bool
+	currentSVN         uint16
 }
 
 // TODO: Implement commands from the following sections of part 3 of the TPM library spec:
@@ -275,7 +278,7 @@ type tpmDeviceProperties struct {
 type TPMContext struct {
 	device             TPMDevice
 	transport          Transport
-	permanentResources map[Handle]*permanentContext
+	permanentResources map[Handle]ResourceContext
 	properties         *tpmDeviceProperties
 	execContext        execContext
 }
@@ -425,6 +428,39 @@ func (t *TPMContext) InitProperties(sessions ...SessionContext) error {
 		return fmt.Errorf("cannot obtain TPM_PT_PCR_SELECT_MIN property: %w", err)
 	}
 
+	// Check for firmware bound hierarchies by testing for the existance of their handles.
+	properties.supportsFWBinding = true
+	for _, handle := range []Handle{HandleFWOwner, HandleFWNull, HandleFWEndorsement, HandleFWPlatform} {
+		if !t.DoesHandleExist(handle, sessions...) {
+			properties.supportsFWBinding = false
+			break
+		}
+	}
+
+	// Check for SVN bound hierarchies first by testing that the TPM_PT_FIRMWARE_SVN
+	// property exists, and then by testing for the existance of each base SVN bound
+	// hierarchy.
+	properties.supportsSVNBinding = true
+	properties.currentSVN, err = t.GetFirmwareSVN(sessions...)
+	if err != nil {
+		properties.supportsSVNBinding = false
+		var e *MissingPropertyError[Property]
+		if !errors.As(err, &e) {
+			// Only fail if we get an error that indicates anything other than
+			// the requested property not existing (as will be the case on pre
+			// 1.81 TPM implementations.
+			return fmt.Errorf("cannot obtain TPM_PT_FIRMWARE_SVN property: %w", err)
+		}
+	}
+	if properties.supportsSVNBinding {
+		for _, handle := range []Handle{HandleSVNOwnerBase, HandleSVNNullBase, HandleSVNEndorsementBase, HandleSVNPlatformBase} {
+			if !t.DoesHandleExist(handle, sessions...) {
+				properties.supportsSVNBinding = false
+				break
+			}
+		}
+	}
+
 	t.properties = &properties
 	return nil
 }
@@ -463,7 +499,7 @@ func OpenTPMDevice(device TPMDevice) (*TPMContext, error) {
 	tpm := &TPMContext{
 		device:             device,
 		transport:          transport,
-		permanentResources: make(map[Handle]*permanentContext),
+		permanentResources: make(map[Handle]ResourceContext),
 	}
 	tpm.execContext.dispatcher = tpm
 

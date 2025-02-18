@@ -668,7 +668,7 @@ func (t *TPMContext) ObjectChangeAuth(objectContext, parentContext ResourceConte
 // object on the TPM, along with the private and public parts.  It will not be necessary to call
 // [ResourceContext].SetAuthValue on the returned ResourceContext - this function sets the correct
 // authorization value so that it can be used in subsequent commands that require knowledge of the
-// authorization value.  The returned ResourceContext can be type asserted to [ObjectContext]. If
+// authorization value. The returned ResourceContext can be type asserted to [ObjectContext]. If
 // the Type field of the template is [ObjectTypeKeyedHash] or [ObjectTypeSymCipher], then the
 // returned *Public object will have a Unique field that is the digest of the sensitive data and
 // the value of the object's seed in the sensitive area, computed using the object's name algorithm.
